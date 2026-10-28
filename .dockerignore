@@ -1,0 +1,8 @@
+.git
+.github
+.venv
+.zed
+.ruff_cache
+**/__pycache__
+Dockerfile
+.dockerignore

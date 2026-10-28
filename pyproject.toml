@@ -2,17 +2,24 @@
 name = "hc-provider"
 version = "0.1.0"
 description = ""
-authors = [
-    {name = "0xChloe",email = "chloe@catastrophesoftware.com"}
-]
+authors = [{ name = "0xChloe", email = "chloe@catastrophesoftware.com" }]
 readme = "README.md"
 requires-python = ">=3.12"
-dependencies = [
-    "fastapi (>=0.136.3,<0.137.0)",
-    "httpx (>=0.28.1,<0.29.0)"
-]
+dependencies = ["fastapi (>=0.136.3,<0.137.0)", "httpx (>=0.28.1,<0.29.0)", "sentry-sdk[fastapi,httpx] (>=2.73.0,<3.0.0)", "uvicorn (>=0.54.0,<0.55.0)"]
 
 
 [build-system]
 requires = ["poetry-core>=2.0.0,<3.0.0"]
 build-backend = "poetry.core.masonry.api"
+
+[dependency-groups]
+dev = ["ty (>=0.0.93,<0.0.94)", "ruff (>=0.17.3,<0.18.0)"]
+
+[tool.ty.environment]
+python = "./.venv/bin/python"
+
+[tool.ruff]
+target-version = "py312"
+
+[tool.ruff.lint]
+extend-select = ["I", "UP", "B"]
