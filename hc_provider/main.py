@@ -8,6 +8,8 @@ import sentry_sdk
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel
 
+from hc_provider.genres import accepted_genres, clean_tags
+
 HARDCOVER_GRAPHQL_URL = "https://api.hardcover.app/v1/graphql"
 HARDCOVER_TOKEN = os.environ.get("HARDCOVER_TOKEN", "").strip()
 USER_AGENT = "hc-provider (+https://github.com/cmathews393/hc_provider)"
@@ -212,8 +214,8 @@ def _map_book(raw: dict) -> BookMetadata:
         cover=image.get("url"),
         isbn=edition.get("isbn_13") or edition.get("isbn_10"),
         asin=audio.get("asin") or None,
-        genres=_cached_tags(raw, "Genre") or None,
-        tags=_cached_tags(raw, "Tag") or None,
+        genres=accepted_genres(_cached_tags(raw, "Genre")) or None,
+        tags=clean_tags(_cached_tags(raw, "Tag")) or None,
         series=series_list or None,
         language=(edition.get("language") or {}).get("language"),
         # Audiobookshelf expects minutes

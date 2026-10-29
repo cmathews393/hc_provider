@@ -31,6 +31,8 @@ docker run -p 8000:8000 -e HARDCOVER_TOKEN="<your token>" ghcr.io/cmathews393/hc
 
 An `isbn` is looked up first. Otherwise the title goes through Hardcover's search, and results are narrowed to those by `author`, unless none match, in which case all results are returned.
 
+Genres are limited to the list in `hc_provider/genres.py`. Hardcover names are cleaned up (case, punctuation, quotes, accents), mapped through a few aliases (e.g. Biography → Biographical) and checked for close misspellings; anything else is dropped. Tags get the same cleanup, and duplicates or near-duplicate misspellings are dropped (the first spelling wins).
+
 ## Development
 
 ```sh
