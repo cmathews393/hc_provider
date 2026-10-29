@@ -6,8 +6,10 @@ A custom metadata provider for [Audiobookshelf](https://www.audiobookshelf.org/)
 
 ```sh
 poetry install
-export HARDCOVER_TOKEN="Bearer <your token>"   # from https://hardcover.app/account/api
+export HARDCOVER_TOKEN="<your token>"   # from https://hardcover.app/account/api
 ```
+
+The token only needs the `read:catalog` scope. A `Bearer ` prefix is optional.
 
 ### Sentry (optional)
 
@@ -20,12 +22,14 @@ Run locally with `poetry run uvicorn hc_provider.main:app`.
 Images are published to `ghcr.io/cmathews393/hc_provider` for `linux/amd64` and `linux/arm64`:
 
 ```sh
-docker run -p 8000:8000 -e HARDCOVER_TOKEN="Bearer <your token>" ghcr.io/cmathews393/hc_provider:latest
+docker run -p 8000:8000 -e HARDCOVER_TOKEN="<your token>" ghcr.io/cmathews393/hc_provider:latest
 ```
 
 ## API
 
-`GET /search?query=<title>&author=<name>` returns `{"matches": [...]}` in Audiobookshelf's custom provider format. If filtering by author finds nothing, the search is retried on title alone.
+`GET /search?query=<title>&author=<name>&isbn=<isbn>` returns `{"matches": [...]}` in Audiobookshelf's custom provider format.
+
+An `isbn` is looked up first. Otherwise the title goes through Hardcover's search, and results are narrowed to those by `author`, unless none match, in which case all results are returned.
 
 ## Development
 

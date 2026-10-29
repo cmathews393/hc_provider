@@ -1,4 +1,5 @@
 import os
+import re
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 
@@ -8,7 +9,8 @@ from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel
 
 HARDCOVER_GRAPHQL_URL = "https://api.hardcover.app/v1/graphql"
-HARDCOVER_TOKEN = os.environ.get("HARDCOVER_TOKEN", "")
+HARDCOVER_TOKEN = os.environ.get("HARDCOVER_TOKEN", "").strip()
+USER_AGENT = "hc-provider (+https://github.com/cmathews393/hc_provider)"
 RESULT_LIMIT = 20
 
 # DSN, environment and release come from SENTRY_DSN, SENTRY_ENVIRONMENT and
@@ -18,14 +20,40 @@ sentry_sdk.init(
     traces_sample_rate=float(os.environ.get("SENTRY_TRACES_SAMPLE_RATE", "1.0")),
 )
 
+# Filtering with _ilike and friends is disabled for API tokens, so matching goes
+# through Hardcover's search index and full details are fetched by id.
+SEARCH_QUERY = """
+query SearchBooks(
+  $query: String!
+  $perPage: Int!
+  $fields: String
+  $weights: String
+  $typos: String
+) {
+  search(
+    query: $query
+    query_type: "book"
+    per_page: $perPage
+    fields: $fields
+    weights: $weights
+    typos: $typos
+  ) {
+    ids
+    error
+  }
+}
+"""
+
+# Kept to three levels of nesting, ahead of Hardcover's planned depth limit.
 BOOKS_QUERY = """
-query SearchBooks($where: books_bool_exp!, $limit: Int!) {
-  books(where: $where, limit: $limit, order_by: [{users_count: desc_nulls_last}]) {
+query BooksById($ids: [Int!]!) {
+  books(where: {id: {_in: $ids}}) {
     id
     title
     subtitle
     description
     release_year
+    audio_seconds
     image {
       url
     }
@@ -47,6 +75,14 @@ query SearchBooks($where: books_bool_exp!, $limit: Int!) {
       language {
         language
       }
+      publisher {
+        name
+      }
+    }
+    default_audio_edition {
+      asin
+      audio_seconds
+      cached_contributors
       publisher {
         name
       }
@@ -88,16 +124,24 @@ _AUTHOR_ROLES = {"", "author", "written by"}
 _NARRATOR_ROLES = {"narrator", "read by", "narrated by"}
 
 
-def _build_where(query: str, author: str | None) -> dict:
-    filters = [
-        {"title": {"_ilike": f"%{query}%"}},
-        {"default_physical_edition": {"language": {"language": {"_is_null": False}}}},
+def _auth_header(token: str) -> str:
+    # Accept the token with or without the "Bearer " prefix
+    if token.lower().startswith("bearer "):
+        token = token[len("bearer ") :].strip()
+    return f"Bearer {token}"
+
+
+def _matches_author(raw: dict, author: str) -> bool:
+    wanted = [
+        part.strip().lower()
+        for part in re.split(r",|&|;| and ", author)
+        if part.strip()
     ]
-    if author:
-        filters.append(
-            {"contributions": {"author": {"name": {"_ilike": f"%{author}%"}}}}
-        )
-    return {"_and": filters}
+    names = [
+        ((c.get("author") or {}).get("name") or "").lower()
+        for c in raw.get("contributions") or []
+    ]
+    return any(w in n or n in w for w in wanted for n in names if n)
 
 
 def _cached_tags(raw: dict, category: str) -> list[str]:
@@ -113,19 +157,29 @@ def _cached_tags(raw: dict, category: str) -> list[str]:
 
 
 def _map_book(raw: dict) -> BookMetadata:
+    audio = raw.get("default_audio_edition") or {}
+
     authors: list[str] = []
     narrators: list[str] = []
     others: list[str] = []
-    for c in raw.get("contributions") or []:
+    # Narrators are usually credited on the audio edition rather than the book
+    for c in [
+        *(raw.get("contributions") or []),
+        *(audio.get("cached_contributors") or []),
+    ]:
+        if not isinstance(c, dict):
+            continue
         name = (c.get("author") or {}).get("name")
         if not name:
             continue
         role = (c.get("contribution") or "").lower().strip()
         if role in _NARRATOR_ROLES:
-            narrators.append(name)
+            if name not in narrators:
+                narrators.append(name)
         elif role in _AUTHOR_ROLES:
-            authors.append(name)
-        else:
+            if name not in authors:
+                authors.append(name)
+        elif name not in others:
             others.append(name)
 
     # Fall back: if no role-tagged authors, take everyone not a narrator
@@ -133,7 +187,7 @@ def _map_book(raw: dict) -> BookMetadata:
         authors = others
 
     edition = raw.get("default_physical_edition") or {}
-    publisher_obj = edition.get("publisher") or {}
+    publisher = (audio.get("publisher") or edition.get("publisher") or {}).get("name")
 
     series_list = [
         SeriesMetadata(
@@ -145,59 +199,130 @@ def _map_book(raw: dict) -> BookMetadata:
     ]
 
     image = raw.get("image") or {}
+    audio_seconds = audio.get("audio_seconds") or raw.get("audio_seconds")
 
     return BookMetadata(
         title=raw["title"],
         subtitle=raw.get("subtitle") or None,
         author=", ".join(authors) if authors else None,
         narrator=", ".join(narrators) if narrators else None,
-        publisher=publisher_obj.get("name"),
+        publisher=publisher,
         publishedYear=str(raw["release_year"]) if raw.get("release_year") else None,
         description=raw.get("description"),
         cover=image.get("url"),
         isbn=edition.get("isbn_13") or edition.get("isbn_10"),
+        asin=audio.get("asin") or None,
         genres=_cached_tags(raw, "Genre") or None,
         tags=_cached_tags(raw, "Tag") or None,
         series=series_list or None,
         language=(edition.get("language") or {}).get("language"),
+        # Audiobookshelf expects minutes
+        duration=round(audio_seconds / 60) if audio_seconds else None,
     )
 
 
-async def _query_books(client: httpx.AsyncClient, where: dict) -> list[dict]:
-    payload = {
-        "query": BOOKS_QUERY,
-        "variables": {"where": where, "limit": RESULT_LIMIT},
-    }
-    with sentry_sdk.start_span(op="graphql.query", name="SearchBooks") as span:
-        span.set_data("graphql.variables", payload["variables"])
+def _upstream_error(resp: httpx.Response) -> HTTPException:
+    try:
+        body = resp.json()
+    except ValueError:
+        body = None
+    if not isinstance(body, dict):
+        body = {}
+    reason = (
+        body.get("error_description")
+        or body.get("message")
+        or body.get("error")
+        or resp.reason_phrase
+    )
+
+    match resp.status_code:
+        case 401:
+            detail = (
+                f"Hardcover rejected HARDCOVER_TOKEN (invalid or expired): {reason}"
+            )
+            return HTTPException(status_code=502, detail=detail)
+        case 403:
+            if scope := body.get("scope"):
+                reason = f"{reason} (token needs scope: {scope})"
+            return HTTPException(
+                status_code=502, detail=f"Hardcover refused the request: {reason}"
+            )
+        case 429:
+            retry_after = resp.headers.get("Retry-After")
+            return HTTPException(
+                status_code=429,
+                detail="Hardcover rate limit reached",
+                headers={"Retry-After": retry_after} if retry_after else None,
+            )
+        case 408:
+            return HTTPException(status_code=504, detail="Hardcover query timed out")
+        case status:
+            return HTTPException(
+                status_code=502, detail=f"Hardcover API error {status}: {reason}"
+            )
+
+
+async def _graphql(
+    client: httpx.AsyncClient, name: str, query: str, variables: dict
+) -> dict:
+    with sentry_sdk.start_span(op="graphql.query", name=name) as span:
+        span.set_data("graphql.variables", variables)
         try:
-            resp = await client.post(HARDCOVER_GRAPHQL_URL, json=payload)
-            resp.raise_for_status()
-        except httpx.HTTPStatusError as exc:
+            resp = await client.post(
+                HARDCOVER_GRAPHQL_URL, json={"query": query, "variables": variables}
+            )
+        except httpx.TimeoutException as exc:
             raise HTTPException(
-                status_code=502,
-                detail=f"Hardcover API error: {exc.response.status_code}",
+                status_code=504, detail="Hardcover API timed out"
             ) from exc
         except httpx.RequestError as exc:
             raise HTTPException(
                 status_code=502, detail=f"Hardcover API unreachable: {exc}"
             ) from exc
+        if resp.is_error:
+            raise _upstream_error(resp)
 
         data = resp.json()
         if "errors" in data:
             raise HTTPException(
                 status_code=502, detail=f"Hardcover GraphQL error: {data['errors']}"
             )
+        return data.get("data") or {}
 
-        books = (data.get("data") or {}).get("books") or []
-        span.set_data("result_count", len(books))
-        return books
+
+async def _search_ids(
+    client: httpx.AsyncClient, query: str, *, isbn: bool = False
+) -> list[int]:
+    variables: dict = {"query": query, "perPage": RESULT_LIMIT}
+    if isbn:
+        # Exact match on ISBNs only, so digits don't fuzzy-match titles
+        variables |= {"fields": "isbns", "weights": "1", "typos": "0"}
+    data = await _graphql(client, "SearchBooks", SEARCH_QUERY, variables)
+    result = data.get("search") or {}
+    if result.get("error"):
+        raise HTTPException(
+            status_code=502, detail=f"Hardcover search error: {result['error']}"
+        )
+    return [i for i in result.get("ids") or [] if i is not None]
+
+
+async def _fetch_books(client: httpx.AsyncClient, ids: list[int]) -> list[dict]:
+    if not ids:
+        return []
+    data = await _graphql(client, "BooksById", BOOKS_QUERY, {"ids": ids})
+    by_id = {b["id"]: b for b in data.get("books") or []}
+    # Keep the search ranking
+    return [by_id[i] for i in ids if i in by_id]
 
 
 @asynccontextmanager
 async def _lifespan(app: FastAPI) -> AsyncGenerator[None]:
     async with httpx.AsyncClient(
-        timeout=15.0, headers={"Authorization": HARDCOVER_TOKEN}
+        timeout=15.0,
+        headers={
+            "Authorization": _auth_header(HARDCOVER_TOKEN),
+            "User-Agent": USER_AGENT,
+        },
     ) as client:
         app.state.client = client
         yield
@@ -210,20 +335,28 @@ app = FastAPI(title="Hardcover Metadata Provider", lifespan=_lifespan)
 async def search(
     query: str = Query(..., description="Search term"),
     author: str | None = Query(None, description="Filter by author name"),
+    isbn: str | None = Query(None, description="Look up by ISBN first"),
 ) -> SearchResponse:
     if not HARDCOVER_TOKEN:
         raise HTTPException(status_code=500, detail="HARDCOVER_TOKEN not configured")
 
     client: httpx.AsyncClient = app.state.client
-    books_raw = await _query_books(client, _build_where(query, author))
 
-    # Author filter may not match when a book is filed under a franchise
-    # owner rather than the actual writer (e.g. Foundation books by Brin/Bear
-    # shelved under Asimov). Fall back to title-only search in that case.
-    fallback = not books_raw and bool(author)
-    sentry_sdk.set_tag("search.author_fallback", fallback)
-    if fallback:
-        books_raw = await _query_books(client, _build_where(query, None))
+    # An ISBN hit is exact, so skip the title search and author filter
+    ids = await _search_ids(client, isbn, isbn=True) if isbn else []
+    sentry_sdk.set_tag("search.isbn_hit", bool(ids))
+    books_raw = await _fetch_books(client, ids)
+
+    if not books_raw:
+        books_raw = await _fetch_books(client, await _search_ids(client, query))
+
+        # Author filter may not match when a book is filed under a franchise
+        # owner rather than the actual writer (e.g. Foundation books by Brin/Bear
+        # shelved under Asimov). Keep the unfiltered results in that case.
+        if author:
+            by_author = [b for b in books_raw if _matches_author(b, author)]
+            sentry_sdk.set_tag("search.author_fallback", not by_author)
+            books_raw = by_author or books_raw
 
     with sentry_sdk.start_span(op="function", name="map_books"):
         matches = [_map_book(b) for b in books_raw]
