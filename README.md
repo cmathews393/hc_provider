@@ -27,9 +27,9 @@ docker run -p 8000:8000 -e HARDCOVER_TOKEN="<your token>" ghcr.io/cmathews393/hc
 
 ## API
 
-`GET /search?query=<title>&author=<name>&isbn=<isbn>` returns `{"matches": [...]}` in Audiobookshelf's custom provider format.
+`GET /search?query=<title>&author=<name>&isbn=<isbn>&format=<ebook|audiobook>` returns `{"matches": [...]}` in Audiobookshelf's custom provider format.
 
-An `isbn` is looked up first. Otherwise the title goes through Hardcover's search, and results are narrowed to those by `author`, unless none match, in which case all results are returned.
+An `isbn` is looked up first. Otherwise the title goes through Hardcover's search, and results are narrowed to those by `author`, unless none match, in which case all results are returned. `format` then works the same way: it keeps books that have an ebook or audio edition on Hardcover, or keeps all of them if none do. With `format=ebook`, ISBN, publisher and language come from the ebook edition.
 
 Genres are limited to the list in `hc_provider/genres.py`. Hardcover names are cleaned up (case, punctuation, quotes, accents), mapped through a few aliases (e.g. Biography → Biographical) and checked for close misspellings; anything else is dropped. Tags get the same cleanup, and duplicates or near-duplicate misspellings are dropped (the first spelling wins).
 

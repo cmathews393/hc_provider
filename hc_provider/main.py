@@ -2,6 +2,7 @@ import os
 import re
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
+from typing import Literal
 
 import httpx
 import sentry_sdk
@@ -89,10 +90,29 @@ query BooksById($ids: [Int!]!) {
         name
       }
     }
+    default_ebook_edition {
+      isbn_13
+      isbn_10
+      language {
+        language
+      }
+      publisher {
+        name
+      }
+    }
     cached_tags
   }
 }
 """
+
+
+Format = Literal["ebook", "audiobook"]
+
+# Books without an edition in the requested format are filtered out
+_FORMAT_EDITION: dict[Format, str] = {
+    "ebook": "default_ebook_edition",
+    "audiobook": "default_audio_edition",
+}
 
 
 class SeriesMetadata(BaseModel):
@@ -158,7 +178,7 @@ def _cached_tags(raw: dict, category: str) -> list[str]:
     ]
 
 
-def _map_book(raw: dict) -> BookMetadata:
+def _map_book(raw: dict, format: Format | None = None) -> BookMetadata:
     audio = raw.get("default_audio_edition") or {}
 
     authors: list[str] = []
@@ -188,8 +208,18 @@ def _map_book(raw: dict) -> BookMetadata:
     if not authors:
         authors = others
 
-    edition = raw.get("default_physical_edition") or {}
-    publisher = (audio.get("publisher") or edition.get("publisher") or {}).get("name")
+    if format == "ebook":
+        edition = raw.get("default_ebook_edition") or raw.get(
+            "default_physical_edition"
+        )
+        publisher_source = edition or {}
+    else:
+        edition = raw.get("default_physical_edition")
+        publisher_source = audio
+    edition = edition or {}
+    publisher = (
+        publisher_source.get("publisher") or edition.get("publisher") or {}
+    ).get("name")
 
     series_list = [
         SeriesMetadata(
@@ -338,6 +368,7 @@ async def search(
     query: str = Query(..., description="Search term"),
     author: str | None = Query(None, description="Filter by author name"),
     isbn: str | None = Query(None, description="Look up by ISBN first"),
+    format: Format | None = Query(None, description="Filter by ebook or audiobook"),
 ) -> SearchResponse:
     if not HARDCOVER_TOKEN:
         raise HTTPException(status_code=500, detail="HARDCOVER_TOKEN not configured")
@@ -360,6 +391,13 @@ async def search(
             sentry_sdk.set_tag("search.author_fallback", not by_author)
             books_raw = by_author or books_raw
 
+        # Hardcover often lacks a default edition for a format, so as with the
+        # author filter, keep the unfiltered results if nothing matches.
+        if format:
+            by_format = [b for b in books_raw if b.get(_FORMAT_EDITION[format])]
+            sentry_sdk.set_tag("search.format_fallback", not by_format)
+            books_raw = by_format or books_raw
+
     with sentry_sdk.start_span(op="function", name="map_books"):
-        matches = [_map_book(b) for b in books_raw]
+        matches = [_map_book(b, format) for b in books_raw]
     return SearchResponse(matches=matches)
